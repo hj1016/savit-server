@@ -22,7 +22,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.Date;
+import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
@@ -36,6 +38,17 @@ public class PaymentService {
     private final CardMapper cardMapper;
     private final CardTransactionMapper cardTransactionMapper;
     private final IamportService iamportService;
+
+    /** 결제 가능한 최소 예치금(원). 0원/음수 결제 방지. */
+    private static final long MIN_AMOUNT = 1_000L;
+    /** 결제 가능한 최대 예치금(원). 금액 조작으로 인한 비정상 결제 방지. */
+    private static final long MAX_AMOUNT = 10_000_000L;
+
+    /**
+     * 낙관락(CAS) 최대 재시도 횟수. 이 횟수만큼 CAS가 실패하면
+     * 비관락(FOR UPDATE) 폴백으로 전환하는 트리거 값이다.
+     */
+    private static final int CAS_MAX_RETRIES = 3;
 
     @Transactional
     public InitPaymentResponseDTO initPayment(Long userId, InitPaymentRequestDTO req) {
@@ -56,7 +69,8 @@ public class PaymentService {
 
         BigDecimal amount = decideAmount(userId, req.getChallengeId(), req.getDesiredAmount());
 
-        String merchantUid = "order-" + userId + "-" + System.currentTimeMillis();
+        // 주문번호는 추측 불가능하도록 UUID 사용 (userId 접두로 가독성만 유지)
+        String merchantUid = "order-" + userId + "-" + UUID.randomUUID().toString().replace("-", "");
         paymentMapper.insertPending(merchantUid, userId, req.getChallengeId(), amount.longValue());
         iamportService.prepare(merchantUid, amount);
 
@@ -66,8 +80,27 @@ public class PaymentService {
                 .build();
     }
 
+    /**
+     * 결제 예치금 확정.
+     * 챌린지는 사용자가 베팅 금액을 직접 정하는 구조(정산 시 예치금 비율로 분배)지만,
+     * 클라이언트 입력값을 그대로 신뢰하지 않고 서버에서 0원·음수·과도한 금액을 차단한다.
+     */
     private BigDecimal decideAmount(Long userId, Long challengeId, BigDecimal desired) {
-        return desired != null ? desired : BigDecimal.ZERO;
+        if (desired == null || desired.signum() <= 0) {
+            throw new IllegalArgumentException("결제 금액(예치금)은 0보다 커야 합니다.");
+        }
+        // 원화 정수만 허용 (소수점 결제 차단)
+        long won;
+        try {
+            won = desired.setScale(0, RoundingMode.UNNECESSARY).longValueExact();
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("결제 금액은 원 단위 정수여야 합니다.");
+        }
+        if (won < MIN_AMOUNT || won > MAX_AMOUNT) {
+            throw new IllegalArgumentException(
+                    "결제 금액은 " + MIN_AMOUNT + "원 이상 " + MAX_AMOUNT + "원 이하여야 합니다. 입력=" + won);
+        }
+        return BigDecimal.valueOf(won);
     }
 
     @Transactional(readOnly = true)
@@ -135,26 +168,105 @@ public class PaymentService {
         log.info("[결제 검증] 결제 성공 반영 완료. merchantUid={}, userId={}, challengeId={}",
                 merchantUid, p.getUserId(), p.getChallengeId());
 
-        // 8) 챌린지 참여 (멱등 + 락) — 환불 미적용
+        // 8) 챌린지 참여 (멱등 + 락)
         boolean joined = tryJoinWithLocks(p.getUserId(), p.getChallengeId(), BigDecimal.valueOf(dbAmount));
         if (!joined) {
-            // 환불은 미적용 상태
-            log.warn("[참여 실패] 정원 마감 또는 경쟁 패배로 참여 확정 실패. 결제는 성공 상태입니다. merchantUid={}, userId={}, challengeId={}",
+            // 결제는 성공했으나 정원 마감/경쟁 패배로 참여 확정 실패 → 자동 환불(보상 트랜잭션)
+            log.warn("[참여 실패] 정원 마감 또는 경쟁 패배로 참여 확정 실패. 자동 환불을 진행합니다. merchantUid={}, userId={}, challengeId={}",
                     merchantUid, p.getUserId(), p.getChallengeId());
-        } else {
-            log.info("[참여 성공] 챌린지 참여 확정. userId={}, challengeId={}", p.getUserId(), p.getChallengeId());
+            refundForFailedJoin(merchantUid, pay.getImpUid(), BigDecimal.valueOf(dbAmount));
+            // 환불 케이스는 카드 트랜잭션/포인트 적립을 하지 않고 종료
+            return;
         }
+        log.info("[참여 성공] 챌린지 참여 확정. userId={}, challengeId={}", p.getUserId(), p.getChallengeId());
 
-        // 9) 카드 트랜잭션 저장
+        // 9) 카드 트랜잭션 저장 (참여 확정된 경우에만)
         insertCardTransactionFromIamport(pay, p.getUserId());
 
-        // 10) 포인트 적립 (일단 항상 적립 / 환불은 추후 추가하거나..)
+        // 10) 포인트 적립 (참여 확정된 경우에만)
         pointMapper.ensureRow(p.getUserId());
         pointMapper.add(p.getUserId(), dbAmount);
         log.info("[포인트] 적립 완료. userId={}, amount={}", p.getUserId(), dbAmount);
     }
 
-    /** 낙관락(CAS) + 막판 비관락으로 안전하게 참여 인서트 (환불 없음 버전) */
+    /** 최대 재시도 배치 크기(1회 실행당 처리 상한). */
+    private static final int REFUND_RETRY_BATCH_SIZE = 100;
+
+    /**
+     * 자동 환불 실패(REFUND_FAILED) 건 목록 조회. 스케줄러가 건별로 재시도하도록 대상만 반환한다.
+     * 조회 자체는 읽기 전용 트랜잭션으로 짧게 처리하고, 실제 환불/상태전이는 건별 트랜잭션으로 분리한다.
+     */
+    @Transactional(readOnly = true)
+    public List<PaymentVO> findRefundFailedTargets() {
+        return paymentMapper.findRefundFailed(REFUND_RETRY_BATCH_SIZE);
+    }
+
+    /**
+     * REFUND_FAILED 결제 1건의 환불을 재시도한다(건별 독립 트랜잭션).
+     * cancel은 멱등(이미 취소된 건은 성공 간주)이므로 반복 호출해도 안전하며,
+     * 성공 시 REFUNDED로 확정한다. impUid가 없으면 자동 재시도가 불가능하므로 상태를 유지한다.
+     *
+     * @return 이번 호출로 환불이 확정(REFUNDED)되면 true
+     */
+    @Transactional
+    public boolean retrySingleRefund(String merchantUid) {
+        PaymentVO p = paymentMapper.findByMerchantUidForUpdate(merchantUid);
+        if (p == null) {
+            log.warn("[환불 재시도] 결제를 찾을 수 없습니다. merchantUid={}", merchantUid);
+            return false;
+        }
+        // 다른 경로/앞선 재시도로 이미 처리됐으면 멱등 종료
+        if (!"REFUND_FAILED".equals(p.getStatus())) {
+            log.info("[환불 재시도] 이미 처리된 상태라 건너뜁니다. merchantUid={}, status={}", merchantUid, p.getStatus());
+            return false;
+        }
+        if (p.getImpUid() == null || p.getImpUid().isBlank()) {
+            // 자동 환불 불가 → 수동 처리 대상으로 REFUND_FAILED 유지
+            log.error("[환불 재시도] impUid가 없어 자동 재시도 불가(수동 처리 필요). merchantUid={}", merchantUid);
+            return false;
+        }
+        iamportService.cancel(p.getImpUid(), BigDecimal.valueOf(p.getAmount()),
+                "챌린지 참여 정원 마감으로 인한 자동 환불(재시도)");
+        paymentMapper.markRefunded(merchantUid);
+        log.info("[환불 재시도] 환불 확정 완료. merchantUid={}, amount={}", merchantUid, p.getAmount());
+        return true;
+    }
+
+    /**
+     * 참여 확정 실패 시 보상 트랜잭션: 아임포트 결제 취소 + 결제 상태를 REFUNDED로 마킹.
+     *
+     * <p>이 시점의 결제는 이미 PG에서 승인(paid)되어 {@code markSuccess}로 SUCCESS가 된 상태다.
+     * 따라서 환불이 실패하더라도 예외를 던져 트랜잭션을 롤백하면 안 된다.
+     * 롤백하면 같은 트랜잭션 안의 {@code markSuccess}까지 되돌아가 상태가 PENDING으로 회귀하는데,
+     * 실제 PG에는 돈이 잡혀 있어 DB-PG 불일치가 "조용히" 발생한다.
+     *
+     * <p>그래서 환불 실패 시에는 예외를 삼키고 같은 트랜잭션에서 {@code REFUND_FAILED} 상태로
+     * 확정 커밋한다. 이렇게 하면 "결제는 성공했으나 자동 환불이 실패해 수동/재시도가 필요"한 건이
+     * DB에 명시적으로 남아 운영 대시보드/재시도 배치가 인지할 수 있다.
+     *
+     * <p>참고로 별도 커밋 트랜잭션(REQUIRES_NEW)은 여기서 부적합하다. 새 트랜잭션은 별도 커넥션이라
+     * 아직 커밋되지 않은 outer 트랜잭션의 SUCCESS를 볼 수 없어, {@code WHERE status='SUCCESS'} 조건이
+     * 빗나가기 때문이다. 동일 트랜잭션 내 상태 전이가 정합적이다.
+     */
+    private void refundForFailedJoin(String merchantUid, String impUid, BigDecimal amount) {
+        if (impUid == null || impUid.isBlank()) {
+            // impUid 없이는 자동 환불 자체가 불가 → 롤백 대신 REFUND_FAILED로 남겨 수동 처리 유도
+            log.error("[환불 불가] impUid가 없어 자동 환불 불가 → REFUND_FAILED 마킹. merchantUid={}", merchantUid);
+            paymentMapper.markRefundFailed(merchantUid);
+            return;
+        }
+        try {
+            iamportService.cancel(impUid, amount, "챌린지 참여 정원 마감으로 인한 자동 환불");
+            paymentMapper.markRefunded(merchantUid);
+            log.info("[환불 완료] 참여 실패분 자동 환불 처리. merchantUid={}, amount={}", merchantUid, amount);
+        } catch (Exception e) {
+            // PG는 이미 paid → SUCCESS를 롤백하지 않고 REFUND_FAILED로 확정 커밋(재시도/수동 처리 대상)
+            log.error("[환불 실패] 자동 환불 실패 → REFUND_FAILED 마킹. merchantUid={}, amount={}", merchantUid, amount, e);
+            paymentMapper.markRefundFailed(merchantUid);
+        }
+    }
+
+    /** 낙관락(CAS) + 막판 비관락으로 안전하게 참여 인서트. 실패 시 호출부에서 자동 환불 처리. */
     private boolean tryJoinWithLocks(Long userId, Long challengeId, BigDecimal myFee) {
         // 이미 참여했다면 멱등 종료
         if (challengeParticipationMapper.existsParticipation(challengeId, userId)) {
@@ -172,8 +284,8 @@ public class PaymentService {
             return insertParticipationIdempotent(challengeId, userId, myFee);
         }
 
-        // 1) 낙관락(CAS) 1~3회
-        for (int i = 0; i < 3; i++) {
+        // 1) 낙관락(CAS): CAS_MAX_RETRIES회 시도, 모두 실패하면 아래 비관락으로 전환
+        for (int i = 0; i < CAS_MAX_RETRIES; i++) {
             int ok = challengeMapper.tryReserveSeatCAS(challengeId, ch.getVersion());
             if (ok == 1) {
                 return insertParticipationIdempotent(challengeId, userId, myFee);

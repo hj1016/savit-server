@@ -41,4 +41,34 @@
           AND status = 'PENDING'
     </update>
 
+    <!--
+      환불 확정. 정상 경로(SUCCESS)뿐 아니라 재시도 배치가 REFUND_FAILED에서 환불에 성공한 경우도
+      REFUNDED로 전이할 수 있도록 두 상태 모두 허용한다.
+    -->
+    <update id="markRefunded">
+        UPDATE Payment
+        SET status = 'REFUNDED'
+        WHERE merchant_uid = #{merchantUid}
+          AND status IN ('SUCCESS', 'REFUND_FAILED')
+    </update>
+
+    <!--
+      자동 환불 실패 건: PG는 paid 이므로 SUCCESS를 유지/전이만 하고 롤백하지 않는다.
+      SUCCESS(정상 경로) 또는 REFUND_FAILED(재시도 중복 마킹) 에서만 전이되도록 가드.
+    -->
+    <update id="markRefundFailed">
+        UPDATE Payment
+        SET status = 'REFUND_FAILED'
+        WHERE merchant_uid = #{merchantUid}
+          AND status IN ('SUCCESS', 'REFUND_FAILED')
+    </update>
+
+    <select id="findRefundFailed" resultMap="PaymentMap">
+        SELECT *
+        FROM Payment
+        WHERE status = 'REFUND_FAILED'
+        ORDER BY created_at ASC
+        LIMIT #{limit}
+    </select>
+
 </mapper>
