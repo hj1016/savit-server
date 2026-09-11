@@ -12,7 +12,7 @@
 [![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
 [![MyBatis](https://img.shields.io/badge/MyBatis-3.4-BE1E2D)](https://mybatis.org/mybatis-3/)
 
-이 저장소는 해커톤 팀 프로젝트 [`IntelliJeju/savit-server`](https://github.com/IntelliJeju/savit-server)를 기반으로, 백엔드 개발자 **김희주**의 담당 기능과 기술적 의사결정을 포트폴리오 목적으로 정리한 Fork입니다. 팀 원본의 이력은 그대로 보존하며, 이후의 개인 학습과 검증은 별도 개선 사항으로 명확히 구분합니다.
+이 저장소는 **KB국민은행 IT 부트캠프 최종 프로젝트** [`IntelliJeju/savit-server`](https://github.com/IntelliJeju/savit-server)를 기반으로, 백엔드 개발자 **김희주**의 담당 기능과 기술적 의사결정을 포트폴리오 목적으로 정리한 Fork입니다. 팀 원본의 이력은 그대로 보존하며, 이후의 개인 학습과 검증은 별도 개선 사항으로 명확히 구분합니다.
 
 - [팀 원본 서버 저장소](https://github.com/IntelliJeju/savit-server)
 - [클라이언트 저장소](https://github.com/IntelliJeju/savit-client)
@@ -109,7 +109,7 @@ flowchart LR
 - CODEF API, 결제 API, Kakao OAuth
 - Gradle, WAR, GitHub Actions
 
-## 해커톤 이후 개인 보완
+## 최종 프로젝트 이후 개인 보완
 
 팀 원본에는 영향을 주지 않고 개인 Fork에서 결제 실패 시나리오를 추가로 보완했습니다.
 
@@ -127,7 +127,7 @@ CODEF 외부망에 부하를 주지 않기 위해 토큰 발급 지연을 400ms�
 
 ## 저장소 운영 방침
 
-- 팀의 해커톤 결과물과 개인 후속 개선을 커밋과 문서에서 구분합니다.
+- 팀의 최종 프로젝트 결과물과 개인 후속 개선을 커밋과 문서에서 구분합니다.
 - 비밀키와 운영 자격증명은 저장소에 포함하지 않습니다.
 - 외부 연동이 필요한 테스트는 stub 또는 test profile에서만 실행합니다.
 
