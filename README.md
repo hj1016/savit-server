@@ -111,13 +111,17 @@ flowchart LR
 
 ## 해커톤 이후 개인 보완
 
-팀 원본에는 영향을 주지 않고, 로컬 환경에서 다음 항목을 추가로 실험했습니다.
+팀 원본에는 영향을 주지 않고 개인 Fork에서 결제 실패 시나리오를 추가로 보완했습니다.
 
-- CODEF 액세스 토큰 DB 캐싱 및 캐시 사용 여부를 비교하는 격리형 부하 테스트
 - 결제 금액 범위와 원 단위 정수 검증 강화
 - 챌린지 참여 실패 시 자동 환불과 `REFUND_FAILED` 상태 관리
 - 실패 환불을 건별 트랜잭션으로 재처리하는 스케줄러
-- k6 시나리오와 MySQL 기반 재현 환경 구성
+
+구현은 [`PaymentService`](src/main/java/com/savit/challenge/service/PaymentService.java)와 [`RefundRetryScheduler`](src/main/java/com/savit/scheduler/job/RefundRetryScheduler.java)에서 확인할 수 있습니다.
+
+### CODEF 토큰 캐시 성능 검증
+
+로컬에서는 CODEF 액세스 토큰 DB 캐싱의 효과를 비교하기 위해 k6 시나리오와 MySQL 기반 재현 환경도 구성했습니다.
 
 CODEF 외부망에 부하를 주지 않기 위해 토큰 발급 지연을 400ms로 모사한 stub 환경에서 측정했습니다. VU 20, 80초 조건에서 토큰 획득 p95가 **816ms에서 5ms**로 감소했습니다. 이 값은 실제 CODEF 운영 성능이 아니라 캐싱 전후의 구조적 차이를 확인하기 위한 로컬 실험 결과입니다.
 
